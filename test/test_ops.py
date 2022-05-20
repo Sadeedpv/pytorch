@@ -46,6 +46,7 @@ from torch.testing._internal.common_device_type import (
     skipMeta,
 )
 import torch._prims as prims
+from torch._prims.context import TorchRefsMode
 
 import torch.testing._internal.opinfo_helper as opinfo_helper
 from torch.testing._internal import composite_compliance
@@ -370,8 +371,7 @@ class TestCommon(TestCase):
     @onlyNativeDeviceTypes
     @ops(python_ref_db)
     def test_python_reference_consistency(self, device, dtype, op):
-        for sample in op.reference_inputs(device, dtype, requires_grad=False):
-
+        def go(sample):
             actual = op(sample.input, *sample.args, **sample.kwargs)
             expected = op.torch_opinfo(sample.input, *sample.args, **sample.kwargs)
 
@@ -395,6 +395,16 @@ class TestCommon(TestCase):
                     prims.utils.compare_tensor_meta(a, b)
                     if getattr(op, 'validate_view_consistency', True):
                         self.assertEqual(a._is_view(), b._is_view())
+
+        for sample in op.reference_inputs(device, dtype, requires_grad=False):
+            # Run the test twice: once directly as written...
+            go(sample)
+            # ...and once rerouting all torch.* function calls to torch._refs.*
+            # instead (testing PrimTorch end-to-end)
+            with TorchRefsMode.push(strict=True):
+                go(sample)
+            # TODO: xfail'ing one of these will xfail both, there is no finer
+            # granularity at the moment
 
 
     @skipMeta
