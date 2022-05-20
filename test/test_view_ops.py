@@ -1,5 +1,4 @@
 # Owner(s): ["module: tests"]
-
 import torch
 import numpy as np
 
@@ -475,6 +474,8 @@ class TestViewOps(TestCase):
         v[0] = 0
         self.assertEqual(t[2, 0], v[0])
 
+    # Lazy hasn't implemented unbind yet.
+    @onlyNativeDeviceTypes
     def test_unbind_view(self, device) -> None:
         t = torch.zeros((5, 5), device=device)
         tup = torch.unbind(t)
@@ -752,6 +753,9 @@ class TestViewOps(TestCase):
         nv[6] = 0
         self.assertNotEqual(t[1, 1], nv[6])
 
+    # This test use as_strided to construct a tensor with overlapping memory,
+    # which is not handled by the functionalization pass.
+    @onlyNativeDeviceTypes
     def test_flatten_view(self, device):
         def test_writes_propagate(t, v):
             idx_t = (0,) * t.ndim

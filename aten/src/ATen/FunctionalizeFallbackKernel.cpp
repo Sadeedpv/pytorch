@@ -5,8 +5,10 @@
 #include <c10/util/irange.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/ATen.h>
 #include <ATen/NativeFunctions.h>
 #else
+#include <ATen/ops/_to_copy.h>
 #include <ATen/ops/to_native.h>
 #include <ATen/ops/resize.h>
 #include <ATen/ops/as_strided.h>
@@ -29,7 +31,7 @@ namespace {
       if (ivalue.isTensor()) {
         any_tensor_inputs = true;
         auto t = ivalue.toTensor();
-        if (at::functionalization::impl::isFunctionalTensor(t)) {
+        if (t.defined() && at::functionalization::impl::isFunctionalTensor(t)) {
           any_functional_inputs = true;
           at::functionalization::impl::sync(t);
           auto t_new = c10::IValue(at::functionalization::impl::from_functional_tensor(t));
@@ -70,6 +72,7 @@ namespace {
       const auto& ivalue = returns[idx];
       if (ivalue.isTensor() && should_wrap_outputs) {
         auto t = ivalue.toTensor();
+        if (!t.defined()) continue;
         auto t_new = c10::IValue(at::functionalization::impl::to_functional_tensor(t));
         (*stack)[returns_begin + idx] = t_new;
       } else if (ivalue.isTensorList() && should_wrap_outputs) {
@@ -168,6 +171,73 @@ at::Tensor lift_functionalize(const at::Tensor & self) {
   return at::functionalization::impl::to_functional_tensor(self);
 }
 
+bool device_opted_into_functionalization(c10::optional<c10::Device> d) {
+    return d.has_value() && (d->type() == c10::DeviceType::XLA || d->type() == c10::DeviceType::Lazy);
+}
+
+at::Tensor to_device_functionalize(const at::Tensor & self, at::Device device, at::ScalarType dtype, bool non_blocking, bool copy, c10::optional<at::MemoryFormat> memory_format) {
+  at::Tensor self_;
+  if (at::functionalization::impl::isFunctionalTensor(self)) {
+    // sync any pending updates
+    at::functionalization::impl::sync(self);
+    // pass the unwrapped tensor to the backend
+    self_ = at::functionalization::impl::from_functional_tensor(self);
+  } else {
+    self_ = self;
+  }
+
+  at::AutoDispatchSkipFunctionalize guard;
+  auto out = self.to(device, dtype, non_blocking, copy, memory_format);
+
+  // Special case: if the Functionalize key is not in TLS, we assume that we're running
+  // on a lazy backend (LTC).
+  // In that case, if we're copying to a non-functionalize-enabled device,
+  // then the functionalization pass should "end". We need to sync any updates on the input
+  // tensor, but we shouldn't wrap the output.
+  if (!c10::impl::tls_local_dispatch_key_set().included_.has(c10::DispatchKey::Functionalize)) {
+    if (!device_opted_into_functionalization(device)) {
+      return out;
+    }
+  }
+  return at::functionalization::impl::to_functional_tensor(out);
+}
+
+// note I only need this because the to.dtype_layout overload calls this, so we skip the op above.
+// We should probably get rid of this though.
+at::Tensor _to_copy_functionalize(
+        const at::Tensor & self,
+        c10::optional<at::ScalarType> dtype,
+        c10::optional<at::Layout> layout,
+        c10::optional<at::Device> device,
+        c10::optional<bool> pin_memory,
+        bool non_blocking,
+        c10::optional<at::MemoryFormat> memory_format) {
+  at::Tensor self_;
+  if (at::functionalization::impl::isFunctionalTensor(self)) {
+    // sync any pending updates
+    at::functionalization::impl::sync(self);
+    // pass the unwrapped tensor to the backend
+    self_ = at::functionalization::impl::from_functional_tensor(self);
+  } else {
+    self_ = self;
+  }
+
+  at::AutoDispatchSkipFunctionalize guard;
+  auto out = at::_to_copy(self_, dtype, layout, device, pin_memory, non_blocking, memory_format);
+
+  // Special case: if the Functionalize key is not in TLS, we assume that we're running
+  // on a lazy backend (LTC).
+  // In that case, if we're copying to a non-functionalize-enabled device,
+  // then the functionalization pass should "end". We need to sync any updates on the input
+  // tensor, but we shouldn't wrap the output.
+  if (!c10::impl::tls_local_dispatch_key_set().included_.has(c10::DispatchKey::Functionalize)) {
+    if (!device_opted_into_functionalization(device)) {
+      return out;
+    }
+  }
+  return at::functionalization::impl::to_functional_tensor(out);
+}
+
 TORCH_LIBRARY_IMPL(_, Functionalize, m) {
   m.fallback(torch::CppFunction::makeFromBoxedFunction<&functionalizeFallback>());
 }
@@ -175,4 +245,6 @@ TORCH_LIBRARY_IMPL(_, Functionalize, m) {
 TORCH_LIBRARY_IMPL(aten, Functionalize, m) {
   m.impl("resize_", TORCH_FN(resize__functionalization));
   m.impl("lift", TORCH_FN(lift_functionalize));
+  m.impl("to.device", TORCH_FN(to_device_functionalize));
+  m.impl("_to_copy", TORCH_FN(_to_copy_functionalize));
 }

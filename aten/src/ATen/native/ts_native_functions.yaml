@@ -29,6 +29,11 @@ full_codegen:
   - cat
   - clamp
   - clamp_min
+  # clone() *should* show up in the IR.
+  # For example, tracing through at::reshape() will insert a clone in cases where the output
+  # needs to be cloned first before constructing a view, when the input strides are incompatible.
+  # This clone needs to be there in order to faithfully re-execute the view later.
+  - clone
   - constant_pad_nd
   - convolution
   - convolution_backward
@@ -93,6 +98,7 @@ full_codegen:
   - native_layer_norm_backward
   - ne.Scalar
   - ne.Tensor
+  - new_empty_strided
   - neg
   - nll_loss_backward
   - nll_loss_forward
@@ -143,39 +149,43 @@ full_codegen:
   - upsample_nearest2d_backward
   - zero.functional
   - narrow_copy.SymInt
+  - alias_copy
+  - as_strided_copy
+  - diagonal_copy
+  - expand_copy
+  - permute_copy
+  - _reshape_alias_copy
+  - select_copy.int
+  - detach_copy
+  - slice_copy.Tensor
+  #- split_copy.Tensor
+  #- split_with_sizes_copy
+  #- unbind_copy.int
+  - squeeze_copy
+  - squeeze_copy.dim
+  - t_copy
+  - transpose_copy.int
+  - unsqueeze_copy
+  - view_copy
+  - view_copy.dtype
+  - unfold_copy
+  - select_scatter
+  - slice_scatter
+  - diagonal_scatter
+  - as_strided_scatter
 supported:
-  - as_strided
-  - as_strided_
-  - clone
   - _copy_from
   - _copy_from_and_resize
-  - diagonal
   - empty.memory_format
   - empty_strided
-  - expand
   - fill_.Scalar
-  - narrow
   - native_batch_norm
   - native_batch_norm_backward
   - normal_
   - max_pool3d_with_indices
   - max_pool3d_with_indices_backward
-  - permute
-  - select.int
-  - slice.Tensor
-  - squeeze
-  - squeeze.dim
-  - squeeze_
-  - squeeze_.dim
-  - t
-  - t_
   - _to_copy
-  - transpose.int
-  - transpose_
-  - unsqueeze
-  - unsqueeze_
-  - view
-  - alias
   - _unsafe_view
+  - lift
 autograd:
   - max_pool3d

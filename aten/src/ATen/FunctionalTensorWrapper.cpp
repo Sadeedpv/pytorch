@@ -22,6 +22,9 @@ void FunctionalTensorWrapper::set_constructor_metadata() {
   refresh_numel();
   refresh_contiguous();
   storage_access_should_throw_ = false;
+  // In general, the sizes/stride metadata on a tensor can change as it is mutated,
+  // and these changes need to be reflected in the metadata of the wrapper.
+  set_allow_tensor_metadata_change(true);
   key_set_ = c10::DispatchKeySet(c10::DispatchKey::Functionalize) | value_.key_set();
   // All of the keys corresponding to functorch transforms should not be copied over.
   // Functorch transforms all have their own wrapper tensors (e.g. BatchedTensorImpl) which expect
@@ -260,6 +263,49 @@ const char* FunctionalTensorWrapper::tensorimpl_type_name() const {
     return "FunctionalTensorWrapper";
 }
 
+template <typename VariableVersion>
+c10::intrusive_ptr<TensorImpl> FunctionalTensorWrapper::shallow_copy_and_detach_core(
+    VariableVersion&& version_counter,
+    bool allow_tensor_metadata_change) const {
+  if (key_set_.has(DispatchKey::Python) &&
+      !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::Python)) {
+    auto r = pyobj_interpreter_.load(std::memory_order_acquire)->detach(this);
+    if (r) {
+      r->set_version_counter(std::forward<VariableVersion>(version_counter));
+      r->set_allow_tensor_metadata_change(allow_tensor_metadata_change);
+      return r;
+    }
+  }
+  auto impl = c10::make_intrusive<FunctionalTensorWrapper>(value_);
+  copy_tensor_metadata(
+      /*src_impl=*/this,
+      /*dest_impl=*/impl.get(),
+      /*version_counter=*/std::forward<VariableVersion>(version_counter),
+      // I want to confirm with someone that this is reasonable.
+      // The autograd kernel for detach() always creates a view of the output
+      // with "allow_tensor_metadata_changes" set to false.
+      // We *always* want this flag to be true for FunctionalTensorWrapper though,
+      // Since mutations later on can changes the size/stride metadata on the wrapper.
+      /*allow_tensor_metadata_change=*/true);
+  impl->refresh_numel();
+  impl->refresh_contiguous();
+  return impl;
+}
+
+c10::intrusive_ptr<TensorImpl> FunctionalTensorWrapper::shallow_copy_and_detach(
+    const c10::VariableVersion& version_counter,
+    bool allow_tensor_metadata_change) const {
+  return shallow_copy_and_detach_core(
+      version_counter, allow_tensor_metadata_change);
+}
+
+c10::intrusive_ptr<TensorImpl> FunctionalTensorWrapper::shallow_copy_and_detach(
+    c10::VariableVersion&& version_counter,
+    bool allow_tensor_metadata_change) const {
+  return shallow_copy_and_detach_core(
+      std::move(version_counter), allow_tensor_metadata_change);
+}
+
 namespace functionalization {
 namespace impl {
 
@@ -310,7 +356,7 @@ std::vector<Tensor> to_functional_tensor(const TensorList& t_list) {
 
 Tensor from_functional_tensor(const Tensor& tensor) {
   // Note [Wrapped Numbers <> Functionalization]
-  if (tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
+  if (!tensor.defined() || tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
       return tensor;
   }
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(isFunctionalTensor(tensor));
@@ -423,41 +469,59 @@ bool isFunctionalTensor(const c10::optional<Tensor>& t) {
 
 bool isFunctionalTensor(const c10::List<Tensor>& t_list) {
   if (t_list.size() == 0) return false;
-  bool any_functional = isFunctionalTensor(t_list[0]);
-  for (const auto i : c10::irange(1, t_list.size())) {
-    auto curr_functional = isFunctionalTensor(t_list[i]);
-    TORCH_INTERNAL_ASSERT(
-         curr_functional == any_functional,
-        "Functionalization encountered a list of tensors where some are functional",
-        "and some are not, which is not currently unsupported.");
+  auto functional_count = 0;
+  auto nonfunctional_count = 0;
+  for (const auto i : c10::irange(t_list.size())) {
+    if (!t_list[i].defined()) continue;
+    if (isFunctionalTensor(t_list[i])) {
+      ++functional_count;
+    } else {
+      ++nonfunctional_count;
+    }
   }
-  return any_functional;
+  TORCH_INTERNAL_ASSERT(
+       functional_count == 0 || nonfunctional_count == 0,
+      "Functionalization encountered a list of tensors where some are functional",
+      "and some are not, which is not currently unsupported.");
+  return functional_count > 0;
 }
 
 bool isFunctionalTensor(const c10::List<c10::optional<Tensor>>& t_list) {
   if (t_list.size() == 0) return false;
-  bool any_functional = isFunctionalTensor(t_list[0]);
-  for (const auto i : c10::irange(1, t_list.size())) {
-    auto curr_functional = isFunctionalTensor(t_list[i]);
-    TORCH_INTERNAL_ASSERT(
-         curr_functional == any_functional,
-        "Functionalization encountered a list of tensors where some are functional",
-        "and some are not, which is not currently unsupported.");
+  auto functional_count = 0;
+  auto nonfunctional_count = 0;
+  for (const auto i : c10::irange(t_list.size())) {
+    if (!t_list[i].has_value() || !t_list[i]->defined()) continue;
+    if (isFunctionalTensor(t_list[i])) {
+      ++functional_count;
+    } else {
+      ++nonfunctional_count;
+    }
   }
-  return any_functional;
+  TORCH_INTERNAL_ASSERT(
+       functional_count == 0 || nonfunctional_count == 0,
+      "Functionalization encountered a list of tensors where some are functional",
+      "and some are not, which is not currently unsupported.");
+  return functional_count > 0;
 }
 
 bool isFunctionalTensor(const c10::ArrayRef<Tensor> t_list) {
   if (t_list.size() == 0) return false;
-  bool any_functional = isFunctionalTensor(t_list[0]);
-  for (const auto i : c10::irange(1, t_list.size())) {
-    auto curr_functional = isFunctionalTensor(t_list[i]);
-    TORCH_INTERNAL_ASSERT(
-         curr_functional == any_functional,
-        "Functionalization encountered a list of tensors where some are functional",
-        "and some are not, which is not currently unsupported.");
+  auto functional_count = 0;
+  auto nonfunctional_count = 0;
+  for (const auto i : c10::irange(t_list.size())) {
+    if (!t_list[i].defined()) continue;
+    if (isFunctionalTensor(t_list[i])) {
+      ++functional_count;
+    } else {
+      ++nonfunctional_count;
+    }
   }
-  return any_functional;
+  TORCH_INTERNAL_ASSERT(
+       functional_count == 0 || nonfunctional_count == 0,
+      "Functionalization encountered a list of tensors where some are functional",
+      "and some are not, which is not currently unsupported.");
+  return functional_count > 0;
 }
 
 Tensor create_functional_tensor_with_view_meta(const at::Tensor& view_to_wrap, const at::Tensor& base, functionalization::ViewMeta meta, int64_t out_idx) {
